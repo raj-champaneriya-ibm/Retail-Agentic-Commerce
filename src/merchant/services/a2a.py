@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime
 from typing import Any, cast
 
+from fastapi import BackgroundTasks
 from sqlmodel import Session
 
 from src.merchant.api.a2a_schemas import A2AMessage, A2APart
@@ -33,11 +34,14 @@ from src.merchant.services.checkout import (
     update_checkout_session,
 )
 from src.merchant.services.idempotency import get_idempotency_store
+from src.merchant.services.post_purchase import OrderItem
+from src.merchant.services.post_purchase_webhook import trigger_post_purchase_flow_ucp
 from src.merchant.services.ucp import (
     NegotiationFailureError,
     build_business_profile,
     compute_capability_intersection,
     fetch_platform_profile,
+    get_platform_order_webhook_url,
     parse_ucp_agent_header,
     transform_to_ucp_response,
 )
@@ -48,7 +52,7 @@ logger = logging.getLogger(__name__)
 # A2A UCP Constants (sourced from official spec: checkout-a2a.md)
 # ---------------------------------------------------------------------------
 
-A2A_UCP_EXTENSION_URL = "https://ucp.dev/specification/reference?v=2026-01-11"
+A2A_UCP_EXTENSION_URL = "https://ucp.dev/2026-01-23/specification/reference/"
 UCP_CHECKOUT_KEY = "a2a.ucp.checkout"
 UCP_PAYMENT_DATA_KEY = "a2a.ucp.checkout.payment"
 UCP_RISK_SIGNALS_KEY = "a2a.ucp.checkout.risk_signals"
@@ -71,6 +75,7 @@ JSONRPC_DISCOVERY_FAILURE = -32002
 # ---------------------------------------------------------------------------
 
 _context_sessions: dict[str, str] = {}
+_context_order_webhook_urls: dict[str, str] = {}
 
 
 def get_checkout_id_for_context(context_id: str) -> str | None:
@@ -83,9 +88,20 @@ def set_checkout_id_for_context(context_id: str, checkout_id: str) -> None:
     _context_sessions[context_id] = checkout_id
 
 
+def get_order_webhook_url_for_context(context_id: str) -> str | None:
+    """Look up negotiated order webhook URL for an A2A contextId."""
+    return _context_order_webhook_urls.get(context_id)
+
+
+def set_order_webhook_url_for_context(context_id: str, webhook_url: str) -> None:
+    """Store negotiated order webhook URL for an A2A contextId."""
+    _context_order_webhook_urls[context_id] = webhook_url
+
+
 def clear_context_sessions() -> None:
     """Clear all context-to-session mappings (for testing)."""
     _context_sessions.clear()
+    _context_order_webhook_urls.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +192,7 @@ def store_message_idempotency(
 _A2ANegotiationResult = tuple[
     dict[str, list[UCPCapabilityVersion]],
     dict[str, list[UCPPaymentHandler]] | None,
+    str | None,
 ]
 
 
@@ -185,7 +202,7 @@ async def negotiate_a2a_capabilities(
 ) -> _A2ANegotiationResult:
     """Run UCP capability negotiation from UCP-Agent header value.
 
-    Returns (negotiated_capabilities, payment_handlers).
+    Returns (negotiated_capabilities, payment_handlers, order_webhook_url).
 
     Raises:
         ValueError / httpx.RequestError  -- discovery failures (JSON-RPC error)
@@ -219,7 +236,8 @@ async def negotiate_a2a_capabilities(
             code="CAPABILITIES_INCOMPATIBLE",
             content="No compatible capabilities in intersection",
         )
-    return negotiated, business_profile.ucp.payment_handlers
+    order_webhook_url = get_platform_order_webhook_url(platform_profile, negotiated)
+    return negotiated, business_profile.ucp.payment_handlers, order_webhook_url
 
 
 # ---------------------------------------------------------------------------
@@ -265,10 +283,11 @@ def extract_payment_data(
 
 async def handle_create(
     data: dict[str, Any],
-    _context_id: str,
+    context_id: str,
     db: Session,
     negotiated: dict[str, list[UCPCapabilityVersion]],
     payment_handlers: dict[str, list[UCPPaymentHandler]] | None = None,
+    order_webhook_url: str | None = None,
 ) -> dict[str, Any]:
     """Handle create_checkout action."""
     items_raw: Any = data.get("line_items") or data.get("items") or []
@@ -291,10 +310,26 @@ async def handle_create(
     if not items:
         raise ValueError("No items provided for create_checkout")
 
-    request = CreateCheckoutRequest(items=items)
+    request_payload: dict[str, Any] = {"items": items}
+    buyer = data.get("buyer")
+    if buyer is not None:
+        request_payload["buyer"] = buyer
+    fulfillment_address = data.get("fulfillment_address")
+    if fulfillment_address is not None:
+        request_payload["fulfillment_address"] = fulfillment_address
+    discounts = data.get("discounts")
+    if discounts is not None:
+        request_payload["discounts"] = discounts
+    coupons = data.get("coupons")
+    if coupons is not None:
+        request_payload["coupons"] = coupons
+
+    request = CreateCheckoutRequest.model_validate(request_payload)
     acp_response = await create_checkout_session(db, request, protocol="ucp")
 
-    set_checkout_id_for_context(_context_id, acp_response.id)
+    set_checkout_id_for_context(context_id, acp_response.id)
+    if order_webhook_url:
+        set_order_webhook_url_for_context(context_id, order_webhook_url)
     return _to_checkout_data_part(acp_response, negotiated, payment_handlers)
 
 
@@ -356,7 +391,23 @@ async def handle_update(
                 pid = str(ri.get("product_id") or ri.get("id", ""))
                 qty = int(ri.get("quantity", 1))
                 items.append(ItemInput(id=pid, quantity=qty))
-        request = UpdateCheckoutRequest(items=items if items else None)
+        request_payload: dict[str, Any] = {"items": items if items else None}
+        buyer = data.get("buyer")
+        if buyer is not None:
+            request_payload["buyer"] = buyer
+        fulfillment_address = data.get("fulfillment_address")
+        if fulfillment_address is not None:
+            request_payload["fulfillment_address"] = fulfillment_address
+        fulfillment_option_id = data.get("fulfillment_option_id")
+        if fulfillment_option_id is not None:
+            request_payload["fulfillment_option_id"] = fulfillment_option_id
+        discounts = data.get("discounts")
+        if discounts is not None:
+            request_payload["discounts"] = discounts
+        coupons = data.get("coupons")
+        if coupons is not None:
+            request_payload["coupons"] = coupons
+        request = UpdateCheckoutRequest.model_validate(request_payload)
 
     acp_response = await update_checkout_session(db, session_id, request)
     return _to_checkout_data_part(acp_response, negotiated, payment_handlers)
@@ -386,21 +437,54 @@ def _resolve_payment_provider(handler_id: str) -> PaymentProviderEnum:
     that handler_id to the internal provider enum used by the checkout
     service.
 
-    Falls back to STRIPE for this reference implementation since it is
-    the only PSP currently configured.
+    This reference implementation currently supports one negotiated
+    handler (processor_tokenizer -> Stripe). Unknown handlers are rejected.
     """
     handler_map: dict[str, PaymentProviderEnum] = {
         "processor_tokenizer": PaymentProviderEnum.STRIPE,
     }
-    return handler_map.get(handler_id, PaymentProviderEnum.STRIPE)
+    provider = handler_map.get(handler_id)
+    if provider is None:
+        raise ValueError(f"Unsupported payment handler_id: {handler_id}")
+    return provider
 
 
-def handle_complete(
+def _is_advertised_payment_handler(
+    handler_id: str,
+    payment_handlers: dict[str, list[UCPPaymentHandler]] | None,
+) -> bool:
+    if payment_handlers is None:
+        return False
+    for versions in payment_handlers.values():
+        for handler in versions:
+            if handler.id == handler_id:
+                return True
+    return False
+
+
+def _extract_customer_name(session: CheckoutSessionResponse) -> str:
+    if session.buyer and session.buyer.first_name:
+        return session.buyer.first_name
+    return "Customer"
+
+
+def _extract_order_items(session: CheckoutSessionResponse) -> list[OrderItem]:
+    items: list[OrderItem] = []
+    for line_item in session.line_items:
+        item_name = line_item.name or line_item.item.id
+        items.append({"name": item_name, "quantity": line_item.item.quantity})
+    if not items:
+        return [{"name": "your order", "quantity": 1}]
+    return items
+
+
+async def handle_complete(
     parts: list[A2APart],
     context_id: str,
     db: Session,
     negotiated: dict[str, list[UCPCapabilityVersion]],
     payment_handlers: dict[str, list[UCPPaymentHandler]] | None = None,
+    background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
     """Handle complete_checkout action with payment data from DataParts.
 
@@ -425,11 +509,17 @@ def handle_complete(
 
     instrument = cast(dict[str, Any], instruments_list[0])
     credential = cast(dict[str, Any], instrument.get("credential", {}))
-    token_val: str = str(credential.get("token", ""))
+    token_val: str = str(credential.get("token") or credential.get("id") or "")
     if not token_val:
         raise ValueError("Payment credential token is required")
 
-    handler_id: str = str(instrument.get("handler_id", ""))
+    handler_id: str = str(
+        instrument.get("handler_id") or instrument.get("handler") or ""
+    )
+    if not handler_id:
+        raise ValueError("Payment instrument handler_id is required")
+    if not _is_advertised_payment_handler(handler_id, payment_handlers):
+        raise ValueError(f"Unsupported payment handler_id: {handler_id}")
     provider = _resolve_payment_provider(handler_id)
 
     payment_data = PaymentDataInput(token=token_val, provider=provider)
@@ -442,6 +532,26 @@ def handle_complete(
             "id": acp_response.order.id,
             "permalink_url": acp_response.order.permalink_url,
         }
+        negotiated_webhook_url = get_order_webhook_url_for_context(context_id)
+        fallback_webhook_url = get_settings().ucp_order_webhook_url
+        webhook_url = negotiated_webhook_url or fallback_webhook_url
+
+        if background_tasks:
+            background_tasks.add_task(
+                trigger_post_purchase_flow_ucp,
+                checkout_session=acp_response,
+                customer_name=_extract_customer_name(acp_response),
+                items=_extract_order_items(acp_response),
+                language="en",
+                webhook_url=webhook_url,
+                negotiated=negotiated,
+            )
+        else:
+            logger.warning(
+                "UCP order %s completed without background task context; "
+                "post-purchase webhook skipped",
+                acp_response.order.id,
+            )
 
     return result
 
@@ -500,6 +610,8 @@ async def dispatch_action(
     db: Session,
     negotiated: dict[str, list[UCPCapabilityVersion]],
     payment_handlers: dict[str, list[UCPPaymentHandler]] | None = None,
+    order_webhook_url: str | None = None,
+    background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
     """Route an action string to the appropriate handler.
 
@@ -509,7 +621,14 @@ async def dispatch_action(
         raise ValueError(f"Unknown action: {action}")
 
     if action == "create_checkout":
-        return await handle_create(data, context_id, db, negotiated, payment_handlers)
+        return await handle_create(
+            data,
+            context_id,
+            db,
+            negotiated,
+            payment_handlers,
+            order_webhook_url=order_webhook_url,
+        )
 
     if action in ("add_to_checkout", "remove_from_checkout", "update_checkout"):
         return await handle_update(
@@ -525,8 +644,13 @@ async def dispatch_action(
         return handle_get(context_id, db, negotiated, payment_handlers)
 
     if action == "complete_checkout":
-        return handle_complete(
-            message.parts, context_id, db, negotiated, payment_handlers
+        return await handle_complete(
+            message.parts,
+            context_id,
+            db,
+            negotiated,
+            payment_handlers,
+            background_tasks=background_tasks,
         )
 
     # cancel_checkout

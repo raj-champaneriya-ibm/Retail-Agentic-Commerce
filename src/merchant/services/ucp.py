@@ -42,6 +42,7 @@ from src.merchant.config import get_settings
 
 CACHE_TTL = timedelta(minutes=10)
 CHECKOUT_CAPABILITY = "dev.ucp.shopping.checkout"
+ORDER_CAPABILITY = "dev.ucp.shopping.order"
 _profile_cache: dict[str, tuple[dict[str, Any], datetime]] = {}
 
 
@@ -111,6 +112,9 @@ def build_business_profile(request_base_url: str | None = None) -> UCPBusinessPr
             },
             capabilities={
                 "dev.ucp.shopping.checkout": [
+                    UCPCapabilityVersion(version=settings.ucp_version)
+                ],
+                "dev.ucp.shopping.order": [
                     UCPCapabilityVersion(version=settings.ucp_version)
                 ],
                 "dev.ucp.shopping.fulfillment": [
@@ -300,6 +304,47 @@ def filter_capabilities_for_checkout(
                 result[cap_name] = versions
                 break
     return result
+
+
+def get_platform_order_webhook_url(
+    platform_profile: dict[str, Any],
+    negotiated: dict[str, list[UCPCapabilityVersion]],
+) -> str | None:
+    """Extract UCP order webhook URL from platform profile capability config.
+
+    The platform advertises order webhook callback support in
+    ``dev.ucp.shopping.order[].config.webhook_url``.
+    """
+    if ORDER_CAPABILITY not in negotiated:
+        return None
+
+    ucp_block: Any = platform_profile.get("ucp")
+    if not isinstance(ucp_block, dict):
+        return None
+    ucp_dict = cast(dict[str, Any], ucp_block)
+
+    capabilities: Any = ucp_dict.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return None
+    capabilities_dict = cast(dict[str, Any], capabilities)
+
+    order_versions_raw: Any = capabilities_dict.get(ORDER_CAPABILITY)
+    if not isinstance(order_versions_raw, list):
+        return None
+
+    for raw_version in cast(list[Any], order_versions_raw):
+        if not isinstance(raw_version, dict):
+            continue
+        raw_version_dict = cast(dict[str, Any], raw_version)
+        config: Any = raw_version_dict.get("config")
+        if not isinstance(config, dict):
+            continue
+        config_dict = cast(dict[str, Any], config)
+        webhook_url: Any = config_dict.get("webhook_url")
+        if isinstance(webhook_url, str) and webhook_url.strip():
+            return webhook_url.strip()
+
+    return None
 
 
 def transform_to_ucp_response(
