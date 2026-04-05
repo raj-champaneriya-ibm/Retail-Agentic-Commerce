@@ -148,7 +148,7 @@ When a checkout is completed, the merchant:
 ### 3.2 Vault Token Lifecycle
 
 ```mermaid
-stateDiagram_v2
+stateDiagram-v2
     state "Token Created" as created
     state "Token Active" as active
     state "Token Consumed" as consumed

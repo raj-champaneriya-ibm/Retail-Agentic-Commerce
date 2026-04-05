@@ -204,7 +204,7 @@ graph LR
 ### 6.1 Checkout Session Lifecycle
 
 ```mermaid
-stateDiagram_v2
+stateDiagram-v2
     state ACP {
         not_ready_for_payment --> ready_for_payment : address_and_shipping_selected
         ready_for_payment --> completed : payment_processed

@@ -415,7 +415,7 @@ sequenceDiagram
 ### 3.4 Vault Token States
 
 ```mermaid
-stateDiagram_v2
+stateDiagram-v2
     active --> consumed : payment_intent_created
     active --> active : duplicate_idempotent_request
 ```
